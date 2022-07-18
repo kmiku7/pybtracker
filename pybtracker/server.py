@@ -26,6 +26,7 @@ class UdpTrackerServerProto(asyncio.Protocol):
             connid = randint(0, 0xffffffffffffffff)
             self.server.connids[connid] = datetime.now()
             self.server.activity[addr] = datetime.now()
+            logging.info(f'new connid:{connid}, ip:{addr[0]}, addr:{addr}')
             return struct.pack('!IIQ', 0, tid, connid)
         else:
             return self.error(tid, 'Invalid protocol identifier.'.encode('utf-8'))
@@ -44,27 +45,43 @@ class UdpTrackerServerProto(asyncio.Protocol):
         if ip == 0:
             ip = addr[0]
 
+        logging.info(f"ih:{ih.hex()} peedid:{peerid.hex()}, dl:{dl}, left:{left}, ul:{ul}, ev:{ev}, ip:{ip}")
+        logging.info(f"k:{k}, num_want:{num_want}, port:{port}")
+
         # make sure the provided connection identifier is valid
         timestamp = self.server.connids.get(connid, None)
         last_valid = datetime.now() - timedelta(seconds=self.server.connid_valid_period)
         if not timestamp:
             # we didn't generate that connection identifier
-            return self.error(tid, 'Invalid connection identifier.'.encode('utf-8'))
-        elif timestamp < last_valid:
+            # logging.error('Invalid connection identifier.')
+            # return self.error(tid, 'Invalid connection identifier.'.encode('utf-8'))
+            
+            # Auto recover
+            timestamp = datetime.now()
+            self.server.connids[connid] = timestamp
+            self.server.activity[addr] = timestamp
+            logging.info(f"auto recover the connid: {connid}")
+
+        # elif timestamp < last_valid:
+        if timestamp < last_valid:
             # we did generate that identifier, but it's too
             # old. remove it and send an error.
             del self.server.connids[connid]
+            logging.error('Old connection identifier.')
             return self.error(tid, 'Old connection identifier.'.encode('utf-8'))
         elif self.allowed_torrents and ih not in self.allowed_torrents:
+            logging.error('Unknown/Forbidden torrent.')
             return self.error(tid, 'Unknown/Forbidden torrent.'.encode('utf-8'))
         else:
-            if ev == 0:
+            # if ev == 0:
+            if False and ev == 0:
                 # make sure this client is not sending regular
                 # announces too frequently
                 allowed = datetime.now() - timedelta(seconds=self.server.interval)
                 if connid in self.server.activity \
                         and self.server.activity[connid] > allowed:
                     self.server.activity[connid] = datetime.now()
+                    logging.error(f"Request too frequent from peerid: {peerid.hex()}, info hash: {ih.hex()}, addr: {addr}")
                     return self.error(
                         tid, 'Requests too frequent.'.encode('utf-8'))
 
@@ -94,7 +111,7 @@ class UdpTrackerServerProto(asyncio.Protocol):
 
             # get a random sample from the peers
             peers = sample(all_peers, num_want)
-
+            logging.info(f"selected peers: {peers}")
             # now pack the (ip, port) pairs
             peers = b''.join(
                 (ip_address(p[0]).packed + p[1].to_bytes(length=2, byteorder='big'))
@@ -117,6 +134,8 @@ class UdpTrackerServerProto(asyncio.Protocol):
             return
 
         connid, action, tid = struct.unpack('!QII', data[:16])
+        if action not in (0, 1):
+            logging.info(f"unknown action: {action}")
         resp = {
             0: self.process_connect,
             1: self.process_announce
@@ -200,6 +219,7 @@ class TrackerServer:
         if ev not in [0, 1, 2, 3]:
             self.logger.warning('Invalid event in announce.')
             return
+        logging.info(f'announce for ip:{ip}, port:{port}')
 
         if ih not in self.torrents:
             self.logger.info('New info hash encountered: {}'.format(ih.hex()))
@@ -211,7 +231,7 @@ class TrackerServer:
 
         if ev == 0:
             # none
-            self.logger.info('Regular announce from: {}'.format(peerid.hex()))
+            self.logger.info('Regular announce from peerid: {}, for info hash: {}'.format(peerid.hex(), ih.hex()))
 
             _ip, _port, _dl, _left, _ul, _completed = self.torrents[ih][peerid]
             if _ip != ip or _port != port:
@@ -220,15 +240,15 @@ class TrackerServer:
             self.torrents[ih][peerid] = (ip, port, dl, left, ul, _completed)
         elif ev == 1:
             # completed
-            self.logger.info('Completion announce from: {}'.format(peerid.hex()))
+            self.logger.info('Completion announce from peerid: {}'.format(peerid.hex()))
             self.torrents[ih][peerid] = (ip, port, dl, left, ul, True)
         elif ev == 2:
             # started
-            self.logger.info('Start announce from: {}'.format(peerid.hex()))
+            self.logger.info('Start announce from peerid: {}'.format(peerid.hex()))
             self.torrents[ih][peerid] = (ip, port, dl, left, ul, True)
         elif ev == 3:
             # stopped
-            self.logger.info('Stop announce from: {}. Removed peer.'.format(peerid.hex()))
+            self.logger.info('Stop announce from peerid: {}. Removed peer.'.format(peerid.hex()))
             del self.torrents[ih][peerid]
             if self.torrents[ih] == {}:
                 del self.torrents[ih]
@@ -254,8 +274,10 @@ def end_point(v):
 def setup_logging(args):
     import sys
     logger = logging.getLogger(__name__)
-    formatter = logging.Formatter(
-        '%(asctime) -15s - %(levelname) -8s - %(message)s')
+    format_str = (
+        '%(asctime) -15s - %(filename)s:%(funcName)s:%(lineno)d - %(levelname) -8s - %(message)s')
+    formatter = logging.Formatter(format_str)
+
     level = {
         'debug': logging.DEBUG,
         'info': logging.INFO,
@@ -263,6 +285,10 @@ def setup_logging(args):
         'error': logging.ERROR,
         'critical': logging.CRITICAL
     }[args.log_level]
+
+    logging.basicConfig(format=format_str, level=level)
+
+    return logger
 
     if args.log_to_stdout:
         handler = logging.StreamHandler(sys.stdout)
